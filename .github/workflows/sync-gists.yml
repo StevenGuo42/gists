@@ -1,0 +1,86 @@
+name: Sync gists
+
+on:
+  schedule:
+    - cron: "23 7 * * *"   # every day at 07:23 UTC
+  workflow_dispatch:        # adds a "Run workflow" button
+
+permissions:
+  contents: write           # lets the job push commits
+
+concurrency:
+  group: sync-gists         # never run two syncs at once
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0    # full history, needed to merge gist updates
+
+      - name: Sync gists
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::The GIST_TOKEN secret is missing. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 1. List every gist you own (public + secret): id <TAB> first file name
+          LIST="$RUNNER_TEMP/gists.tsv"
+          gh api --paginate /gists --jq '.[] | [.id, (.files | keys[0])] | @tsv' > "$LIST"
+          if [ ! -s "$LIST" ]; then
+            echo "No gists returned by the API; nothing to do."
+            exit 0
+          fi
+          echo "Found $(wc -l < "$LIST") gists."
+
+          declare -A keep
+
+          # 2. Add new gists, merge updates into existing folders
+          while IFS=$'\t' read -r id file <&3; do
+            short="${id:0:7}"
+            keep[$short]=1
+
+            if ! git fetch -q "https://gist.github.com/$id.git"; then
+              echo "::warning::Could not fetch gist $id ($file), skipped."
+              continue
+            fi
+
+            dir=$(find . -mindepth 1 -maxdepth 1 -type d -name "*_${short}" -printf '%f\n' | head -n1)
+
+            if [ -z "$dir" ]; then
+              name="${file%.*}"; name="${name:-${file#.}}"; name="${name// /-}"
+              dir="${name}_${short}"
+              git subtree add -q --prefix="$dir" FETCH_HEAD -m "Add gist $id ($file)"
+              echo "Added   $dir"
+              continue
+            fi
+
+            before=$(git rev-parse HEAD)
+            if git subtree merge -q --prefix="$dir" FETCH_HEAD -m "Update gist $id ($file)" > /dev/null; then
+              [ "$before" != "$(git rev-parse HEAD)" ] && echo "Updated $dir"
+            else
+              echo "::warning::Conflict merging gist $id into $dir (was the folder edited in this repo?), skipped."
+              git merge --abort || true
+            fi
+          done 3< "$LIST"
+
+          # 3. Remove folders of gists you deleted (only folders this sync created)
+          while read -r dir; do
+            [ -d "$dir" ] || continue
+            [ -n "${keep[${dir##*_}]:-}" ] && continue
+            git rm -rq -- "$dir"
+            git commit -qm "Remove deleted gist $dir"
+            echo "Removed $dir"
+          done < <(git log --format=%B | sed -n 's/^git-subtree-dir: //p' | sort -u)
+
+          # 4. Publish
+          git push
