@@ -1,0 +1,128 @@
+name: Sync gists
+
+on:
+  schedule:
+    - cron: "23 7 * * *"   # every day at 07:23 UTC
+  workflow_dispatch:        # adds a "Run workflow" button
+
+permissions:
+  contents: write           # lets the job push commits
+
+concurrency:
+  group: sync-gists         # never run two syncs at once
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0    # full history, needed to merge gist updates
+
+      - name: Sync gists
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::The GIST_TOKEN secret is missing. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 1. List every gist you own (public + secret), one JSON object per line
+          GISTS="$RUNNER_TEMP/gists.jsonl"
+          gh api --paginate /gists \
+            --jq '.[] | {id, description, public, updated_at, html_url, files: (.files | keys)} | tojson' > "$GISTS"
+          if [ ! -s "$GISTS" ]; then
+            echo "No gists returned by the API; nothing to do."
+            exit 0
+          fi
+          echo "Found $(wc -l < "$GISTS") gists."
+
+          declare -A keep
+
+          # 2. Add new gists, merge updates into existing folders
+          while IFS=$'\t' read -r id file <&3; do
+            short="${id:0:7}"
+            keep[$short]=1
+
+            if ! git fetch -q "https://gist.github.com/$id.git"; then
+              echo "::warning::Could not fetch gist $id ($file), skipped."
+              continue
+            fi
+
+            dir=$(find . -mindepth 1 -maxdepth 1 -type d -name "*_${short}" -printf '%f\n' | head -n1)
+
+            if [ -z "$dir" ]; then
+              name="${file%.*}"; name="${name:-${file#.}}"; name="${name// /-}"
+              dir="${name}_${short}"
+              git subtree add -q --prefix="$dir" FETCH_HEAD -m "Add gist $id ($file)"
+              echo "Added   $dir"
+              continue
+            fi
+
+            before=$(git rev-parse HEAD)
+            if git subtree merge -q --prefix="$dir" FETCH_HEAD -m "Update gist $id ($file)" > /dev/null; then
+              [ "$before" != "$(git rev-parse HEAD)" ] && echo "Updated $dir"
+            else
+              echo "::warning::Conflict merging gist $id into $dir (was the folder edited in this repo?), skipped."
+              git merge --abort || true
+            fi
+          done 3< <(jq -r '[.id, .files[0]] | @tsv' "$GISTS")
+
+          # 3. Remove folders of gists you deleted (only folders this sync created)
+          while read -r dir; do
+            [ -d "$dir" ] || continue
+            [ -n "${keep[${dir##*_}]:-}" ] && continue
+            git rm -rq -- "$dir"
+            git commit -qm "Remove deleted gist $dir"
+            echo "Removed $dir"
+          done < <(git log --format=%B | sed -n 's/^git-subtree-dir: //p' | sort -u)
+
+          # 4. Rebuild the gist table in README.md (between the two markers)
+          START='<!-- gists:start -->'
+          END='<!-- gists:end -->'
+          TABLE="$RUNNER_TEMP/table.md"
+          [ -f README.md ] || printf '# Gists\n' > README.md
+          if ! grep -qxF "$START" README.md; then
+            grep -vxF "$END" README.md > "$RUNNER_TEMP/readme.tmp" || true
+            printf '\n%s\n%s\n' "$START" "$END" >> "$RUNNER_TEMP/readme.tmp"
+            mv "$RUNNER_TEMP/readme.tmp" README.md
+          elif ! grep -qxF "$END" README.md; then
+            printf '\n%s\n' "$END" >> README.md
+          fi
+
+          find . -mindepth 1 -maxdepth 1 -type d -name '*_*' -printf '%f\n' \
+            | jq -Rn '[inputs | {key: (split("_") | last), value: .}] | from_entries' > "$RUNNER_TEMP/dirs.json"
+
+          {
+            echo "_$(wc -l < "$GISTS") gists, newest first. The Sync gists workflow rebuilds this table; edits between the markers are overwritten._"
+            echo
+            echo "| Folder | Description | Files | Visibility | Updated | Gist |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            jq -rs --slurpfile dirs "$RUNNER_TEMP/dirs.json" '
+              def esc: gsub("[\r\n]+"; " ") | gsub("\\|"; "\\|");
+              sort_by(.updated_at) | reverse | .[]
+              | $dirs[0][.id[0:7]] as $d
+              | "| \(if $d then "[\($d | esc)](\($d | @uri))" else "" end) | \(.description // "" | esc) | \(.files | map("`\(esc)`") | join(", ")) | \(if .public then "Public" else "Secret" end) | \(.updated_at[0:10]) | [Open](\(.html_url)) |"
+            ' "$GISTS"
+          } > "$TABLE"
+
+          awk -v s="$START" -v e="$END" -v f="$TABLE" '
+            $0 == s { print; while ((getline line < f) > 0) print line; skip = 1; next }
+            $0 == e { skip = 0 }
+            !skip   { print }
+          ' README.md > "$RUNNER_TEMP/readme.new"
+          mv "$RUNNER_TEMP/readme.new" README.md
+          git add README.md
+          if ! git diff --cached --quiet; then
+            git commit -qm "Update gist table in README"
+            echo "README table updated"
+          fi
+
+          # 5. Publish
+          git push
