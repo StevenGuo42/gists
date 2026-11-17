@@ -33,14 +33,15 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 1. List every gist you own (public + secret): id <TAB> first file name
-          LIST="$RUNNER_TEMP/gists.tsv"
-          gh api --paginate /gists --jq '.[] | [.id, (.files | keys[0])] | @tsv' > "$LIST"
-          if [ ! -s "$LIST" ]; then
+          # 1. List every gist you own (public + secret), one JSON object per line
+          GISTS="$RUNNER_TEMP/gists.jsonl"
+          gh api --paginate /gists \
+            --jq '.[] | {id, description, public, updated_at, html_url, files: (.files | keys)} | tojson' > "$GISTS"
+          if [ ! -s "$GISTS" ]; then
             echo "No gists returned by the API; nothing to do."
             exit 0
           fi
-          echo "Found $(wc -l < "$LIST") gists."
+          echo "Found $(wc -l < "$GISTS") gists."
 
           declare -A keep
 
@@ -71,7 +72,7 @@ jobs:
               echo "::warning::Conflict merging gist $id into $dir (was the folder edited in this repo?), skipped."
               git merge --abort || true
             fi
-          done 3< "$LIST"
+          done 3< <(jq -r '[.id, .files[0]] | @tsv' "$GISTS")
 
           # 3. Remove folders of gists you deleted (only folders this sync created)
           while read -r dir; do
@@ -82,5 +83,46 @@ jobs:
             echo "Removed $dir"
           done < <(git log --format=%B | sed -n 's/^git-subtree-dir: //p' | sort -u)
 
-          # 4. Publish
+          # 4. Rebuild the gist table in README.md (between the two markers)
+          START='<!-- gists:start -->'
+          END='<!-- gists:end -->'
+          TABLE="$RUNNER_TEMP/table.md"
+          [ -f README.md ] || printf '# Gists\n' > README.md
+          if ! grep -qxF "$START" README.md; then
+            grep -vxF "$END" README.md > "$RUNNER_TEMP/readme.tmp" || true
+            printf '\n%s\n%s\n' "$START" "$END" >> "$RUNNER_TEMP/readme.tmp"
+            mv "$RUNNER_TEMP/readme.tmp" README.md
+          elif ! grep -qxF "$END" README.md; then
+            printf '\n%s\n' "$END" >> README.md
+          fi
+
+          find . -mindepth 1 -maxdepth 1 -type d -name '*_*' -printf '%f\n' \
+            | jq -Rn '[inputs | {key: (split("_") | last), value: .}] | from_entries' > "$RUNNER_TEMP/dirs.json"
+
+          {
+            echo "_$(wc -l < "$GISTS") gists, newest first. The Sync gists workflow rebuilds this table; edits between the markers are overwritten._"
+            echo
+            echo "| Folder | Description | Files | Visibility | Updated | Gist |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            jq -rs --slurpfile dirs "$RUNNER_TEMP/dirs.json" '
+              def esc: gsub("[\r\n]+"; " ") | gsub("\\|"; "\\|");
+              sort_by(.updated_at) | reverse | .[]
+              | $dirs[0][.id[0:7]] as $d
+              | "| \(if $d then "[\($d | esc)](\($d | @uri))" else "" end) | \(.description // "" | esc) | \(.files | map("`\(esc)`") | join(", ")) | \(if .public then "Public" else "Secret" end) | \(.updated_at[0:10]) | [Open](\(.html_url)) |"
+            ' "$GISTS"
+          } > "$TABLE"
+
+          awk -v s="$START" -v e="$END" -v f="$TABLE" '
+            $0 == s { print; while ((getline line < f) > 0) print line; skip = 1; next }
+            $0 == e { skip = 0 }
+            !skip   { print }
+          ' README.md > "$RUNNER_TEMP/readme.new"
+          mv "$RUNNER_TEMP/readme.new" README.md
+          git add README.md
+          if ! git diff --cached --quiet; then
+            git commit -qm "Update gist table in README"
+            echo "README table updated"
+          fi
+
+          # 5. Publish
           git push
