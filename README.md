@@ -1,1 +1,9 @@
 # gists
+
+<!-- gists:start -->
+_1 gists, newest first. The Sync gists workflow rebuilds this table; edits between the markers are overwritten._
+
+| Folder | Description | Files | Visibility | Updated | Gist |
+| --- | --- | --- | --- | --- | --- |
+| [fix_mendeley_dupes_5c9f6a8](fix_mendeley_dupes_5c9f6a8) | Mendeley MS Word De-dup | `fix_mendeley_dupes.py` | Secret | 2026-11-17 | [Open](https://gist.github.com/StevenGuo42/5c9f6a8663917b8b0bb309caa0efa6f8) |
+<!-- gists:end -->
